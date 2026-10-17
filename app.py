@@ -51,7 +51,7 @@ def list_windows():
 
 
 class CaptureSession:
-    def __init__(self, event_queue, mic_id, capture_kind, capture_value, server_url, api_key, backend):
+    def __init__(self, event_queue, mic_id, capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model):
         self.events = event_queue
         self.mic_id = mic_id
         self.capture_kind = capture_kind
@@ -60,6 +60,8 @@ class CaptureSession:
         self.server_url = server_url.rstrip("/")
         self.api_key = api_key
         self.backend = backend
+        self.gpu_model = gpu_model
+        self.cpu_model = cpu_model
         self.local_model = None
         self.stop_event = threading.Event()
         self.audio_queue = queue.Queue()
@@ -216,7 +218,7 @@ class CaptureSession:
             if self.backend == "gpu":
                 self.events.put(("status", "GPUサーバーで文字起こし中"))
             else:
-                self.events.put(("status", "このPCのCPU（smallモデル）で文字起こし中"))
+                self.events.put(("status", f"このPCのCPU（{self.cpu_model}モデル）で文字起こし中"))
             batch = []
             sample_count = 0
             total_samples = 0
@@ -244,7 +246,7 @@ class CaptureSession:
             try:
                 response = requests.post(
                     self.server_url + "/transcribe/chunk",
-                    params={"offset": offset_samples / SAMPLE_RATE},
+                    params={"offset": offset_samples / SAMPLE_RATE, "model": self.gpu_model},
                     headers={"X-API-Key": self.api_key, "Content-Type": "application/octet-stream"},
                     data=audio.astype("<f4", copy=False).tobytes(),
                     timeout=(4, 180),
@@ -266,7 +268,7 @@ class CaptureSession:
         if self.local_model is None:
             self.events.put(("status", "このPC用の文字起こしモデルを準備しています（初回はモデルを取得します）…"))
             from faster_whisper import WhisperModel
-            self.local_model = WhisperModel("small", device="cpu", compute_type="int8")
+            self.local_model = WhisperModel(self.cpu_model, device="cpu", compute_type="int8")
         segments, _ = self.local_model.transcribe(audio, language="ja", vad_filter=True, beam_size=5)
         return [
             {"start": offset_seconds + segment.start, "text": segment.text.strip()}
@@ -360,7 +362,17 @@ class App(tk.Tk):
         except Exception:
             pass
         self.mic_box["values"] = list(self.mic_ids)
-        ttk.Label(controls, text="GPU PCが使えない場合はこのPCで処理").pack(side="left", padx=(10, 0))
+        model_controls = ttk.Frame(root)
+        model_controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(model_controls, text="GPU使用時").pack(side="left")
+        self.gpu_model_var = tk.StringVar(value="medium")
+        self.gpu_model_box = ttk.Combobox(model_controls, textvariable=self.gpu_model_var, values=("medium", "small"), state="readonly", width=10)
+        self.gpu_model_box.pack(side="left", padx=6)
+        ttk.Label(model_controls, text="CPU使用時").pack(side="left", padx=(10, 0))
+        self.cpu_model_var = tk.StringVar(value="small")
+        self.cpu_model_box = ttk.Combobox(model_controls, textvariable=self.cpu_model_var, values=("small", "base", "tiny"), state="readonly", width=10)
+        self.cpu_model_box.pack(side="left", padx=6)
+        ttk.Label(model_controls, text="GPU PCが使えない場合はCPUモデルに自動切替").pack(side="left", padx=(8, 0))
         self.start_btn = ttk.Button(controls, text="録画開始", command=self._start)
         self.start_btn.pack(side="left", padx=(12, 4))
         self.stop_btn = ttk.Button(controls, text="録画停止", command=self._stop, state="disabled")
@@ -406,12 +418,10 @@ class App(tk.Tk):
             messagebox.showwarning("録画対象", "録画対象を選択してください。アプリが一覧にない場合は一覧を更新してください。")
             return
         backend = "local"
-        server_model = None
         if server_url and api_key:
             try:
                 health = requests.get(server_url + "/health", headers={"X-API-Key": api_key}, timeout=4)
                 health.raise_for_status()
-                server_model = health.json().get("model", "不明")
                 backend = "gpu"
             except Exception as exc:
                 self.status.set(f"GPU PCに接続できないため、このPCで処理します: {exc}")
@@ -426,16 +436,18 @@ class App(tk.Tk):
         self.mux_started = False
         self.text.delete("1.0", "end")
         capture_kind, capture_value = self.capture_targets[self.target_var.get()]
-        self.session = CaptureSession(self.events, self.mic_ids.get(self.mic_var.get()), capture_kind, capture_value, server_url, api_key, backend)
+        gpu_model = self.gpu_model_var.get()
+        cpu_model = self.cpu_model_var.get()
+        self.session = CaptureSession(self.events, self.mic_ids.get(self.mic_var.get()), capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.mic_box.configure(state="disabled")
         self.target_box.configure(state="disabled")
         self.session.start()
         if backend == "gpu":
-            self.status.set(f"録画を開始しています（GPU PC: {server_model}）…")
+            self.status.set(f"録画を開始しています（GPU PC: {gpu_model}、CPU fallback: {cpu_model}）…")
         else:
-            self.status.set("録画を開始しています（ローカルCPU・smallモデル）…")
+            self.status.set(f"録画を開始しています（ローカルCPU・{cpu_model}モデル）…")
 
     def _stop(self):
         if self.session:
@@ -572,21 +584,23 @@ class App(tk.Tk):
         self.text.delete("1.0", "end")
         self.import_btn.configure(state="disabled")
         self.status.set(f"{len(paths)}ファイルを順番に文字起こしします…")
-        threading.Thread(target=self._transcribe_files, args=(paths, server_url, api_key), daemon=True).start()
+        gpu_model = self.gpu_model_var.get()
+        cpu_model = self.cpu_model_var.get()
+        threading.Thread(target=self._transcribe_files, args=(paths, server_url, api_key, gpu_model, cpu_model), daemon=True).start()
 
-    def _transcribe_files(self, paths, server_url, api_key):
+    def _transcribe_files(self, paths, server_url, api_key, gpu_model, cpu_model):
         failures = []
         for index, file_path in enumerate(paths, 1):
             path = Path(file_path)
             self.events.put(("file_started", (str(path), index, len(paths))))
             try:
-                self._transcribe_file(path, server_url, api_key)
+                self._transcribe_file(path, server_url, api_key, gpu_model, cpu_model)
             except Exception as exc:
                 failures.append((str(path), str(exc)))
                 self.events.put(("file_error", (str(path), str(exc))))
         self.events.put(("file_batch_done", (len(paths) - len(failures), failures)))
 
-    def _transcribe_file(self, path, server_url, api_key):
+    def _transcribe_file(self, path, server_url, api_key, gpu_model, cpu_model):
         temp_dir = None
         try:
             import tempfile
@@ -608,6 +622,7 @@ class App(tk.Tk):
                         response = requests.post(
                             server_url + "/transcribe/file",
                             headers={"X-API-Key": api_key},
+                            params={"model": gpu_model},
                             files={"file": (audio_path.name, audio_file, "application/octet-stream")},
                             timeout=(20, 14400),
                         )
@@ -616,9 +631,9 @@ class App(tk.Tk):
                 except Exception as exc:
                     self.events.put(("status", f"GPU PCを使えないため、このPCで文字起こしします: {exc}"))
             if segments is None:
-                self.events.put(("status", "このPCのCPUで文字起こし中です（smallモデル）…"))
+                self.events.put(("status", f"このPCのCPUで文字起こし中です（{cpu_model}モデル）…"))
                 from faster_whisper import WhisperModel
-                model = WhisperModel("small", device="cpu", compute_type="int8")
+                model = WhisperModel(cpu_model, device="cpu", compute_type="int8")
                 local_segments, _ = model.transcribe(str(audio_path), language="ja", vad_filter=True, beam_size=5)
                 segments = [
                     {"start": segment.start, "end": segment.end, "text": segment.text}

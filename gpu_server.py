@@ -1,11 +1,12 @@
 import hmac
+import gc
 import os
 import tempfile
 import threading
 from pathlib import Path
 
 import numpy as np
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from faster_whisper import WhisperModel
 
 MODEL_NAME = os.environ.get("WHISPER_MODEL", "medium")
@@ -13,6 +14,7 @@ API_KEY = os.environ.get("TRANSCRIBE_API_KEY", "")
 SAMPLE_RATE = 16000
 MODEL = None
 MODEL_LOCK = threading.Lock()
+ALLOWED_MODELS = {"tiny", "base", "small", "medium"}
 app = FastAPI(title="LAN GPU Transcription Service")
 
 
@@ -35,11 +37,17 @@ def health():
     return {"ready": MODEL is not None, "model": MODEL_NAME, "device": "cuda"}
 
 
-def transcribe_audio(audio):
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="GPU model is not ready")
+def transcribe_audio(audio, model_name=MODEL_NAME):
+    global MODEL, MODEL_NAME
+    if model_name not in ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail="Unsupported model")
     output = []
     with MODEL_LOCK:
+        if MODEL is None or MODEL_NAME != model_name:
+            MODEL = None
+            gc.collect()
+            MODEL = WhisperModel(model_name, device="cuda", compute_type="float16")
+            MODEL_NAME = model_name
         segments, _ = MODEL.transcribe(audio, language="ja", vad_filter=True, beam_size=5)
         for segment in segments:
             text = segment.text.strip()
@@ -49,7 +57,7 @@ def transcribe_audio(audio):
 
 
 @app.post("/transcribe/chunk", dependencies=[Depends(verify_api_key)])
-async def transcribe_chunk(request: Request, offset: float = 0.0):
+async def transcribe_chunk(request: Request, offset: float = 0.0, model: str = Query(default=MODEL_NAME)):
     # Client sends raw little-endian float32 mono samples at 16 kHz.
     body = await request.body()
     if len(body) % 4:
@@ -57,7 +65,7 @@ async def transcribe_chunk(request: Request, offset: float = 0.0):
     audio = np.frombuffer(body, dtype="<f4").copy()
     if not len(audio):
         return {"segments": []}
-    segments = transcribe_audio(audio)
+    segments = transcribe_audio(audio, model)
     for segment in segments:
         segment["start"] += offset
         segment["end"] += offset
@@ -65,7 +73,7 @@ async def transcribe_chunk(request: Request, offset: float = 0.0):
 
 
 @app.post("/transcribe/file", dependencies=[Depends(verify_api_key)])
-def transcribe_file(file: UploadFile = File(...)):
+def transcribe_file(file: UploadFile = File(...), model: str = Query(default=MODEL_NAME)):
     suffix = Path(file.filename or "audio.wav").suffix.lower()
     if suffix not in {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".wma"}:
         raise HTTPException(status_code=415, detail="Only audio files are accepted; extract video audio on the client first")
@@ -75,8 +83,8 @@ def transcribe_file(file: UploadFile = File(...)):
             temp_path = Path(temp_file.name)
             while data := file.file.read(1024 * 1024):
                 temp_file.write(data)
-        segments = transcribe_audio(str(temp_path))
-        return {"model": MODEL_NAME, "segments": segments}
+        segments = transcribe_audio(str(temp_path), model)
+        return {"model": model, "segments": segments}
     finally:
         file.file.close()
         if temp_path:
