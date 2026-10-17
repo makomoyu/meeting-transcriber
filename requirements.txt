@@ -1,0 +1,10 @@
+numpy>=1.26
+soundcard>=0.4.3
+mss>=9.0
+opencv-python>=4.9
+Pillow>=10.0
+imageio-ffmpeg>=0.4.9
+requests>=2.32
+faster-whisper>=1.1
+windows-capture>=2.0
+av>=11,<19
