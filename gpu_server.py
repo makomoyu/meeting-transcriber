@@ -4,7 +4,42 @@ import os
 import tempfile
 import threading
 from pathlib import Path
+# 手順1：WindowsでCUDA関連DLLを検索できるようにする。
+# Python 3.8以降では、DLLの検索フォルダを明示的に登録できる。
+import sysconfig
 
+# DLL検索用のハンドルを保持し、登録が解除されないようにする。
+_CUDA_DLL_HANDLES = []
+
+
+def configure_cuda_dll_paths():
+    """CUDA 12・cuDNN 9関連のDLL検索パスを登録する。"""
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    nvidia_dir = site_packages / "nvidia"
+
+    # 手順2：必要なDLLが配置される可能性のあるフォルダを登録する。
+    dll_directories = [
+        nvidia_dir / "cublas" / "bin",
+        nvidia_dir / "cudnn" / "bin",
+        nvidia_dir / "cuda_nvrtc" / "bin",
+        site_packages / "ctranslate2",
+    ]
+
+    for directory in dll_directories:
+        if directory.is_dir():
+            try:
+                _CUDA_DLL_HANDLES.append(
+                    os.add_dll_directory(str(directory))
+                )
+                print(f"CUDA DLL directory registered: {directory}")
+            except OSError as exc:
+                print(f"CUDA DLL directory registration failed: {exc}")
+
+
+# 手順3：faster-whisperを読み込む前に実行する。
+configure_cuda_dll_paths()
+
+import numpy as np
 import numpy as np
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from faster_whisper import WhisperModel
