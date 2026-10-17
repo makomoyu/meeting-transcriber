@@ -422,11 +422,15 @@ class App(tk.Tk):
             try:
                 health = requests.get(server_url + "/health", headers={"X-API-Key": api_key}, timeout=4)
                 health.raise_for_status()
-                backend = "gpu"
+                health_data = health.json()
+                if health_data.get("ready") and health_data.get("gpu_available") and health_data.get("device") == "cuda":
+                    backend = "gpu"
+                else:
+                    self.status.set(f"GPUを利用できないため、このPCのCPU（{self.cpu_model_var.get()}モデル）で処理します")
             except Exception as exc:
                 self.status.set(f"GPU PCに接続できないため、このPCで処理します: {exc}")
         else:
-            self.status.set("GPU PCの接続情報がないため、このPCで処理します（CPU・smallモデル）")
+            self.status.set(f"GPU PCの接続情報がないため、このPCのCPU（{self.cpu_model_var.get()}モデル）で処理します")
         RECORDINGS_DIR.mkdir(exist_ok=True)
         self.transcript_lines = []
         self.transcript_entries = []
@@ -471,10 +475,29 @@ class App(tk.Tk):
                     self.status.set(value)
                 elif kind == "server_ok":
                     self.test_server_btn.configure(state="normal")
-                    self.status.set(value)
+                    model = value.get("model", "不明")
+                    device = value.get("device", "不明")
+                    self.status.set(f"GPU利用可能: {model} / {device}")
+                    messagebox.showinfo(
+                        "GPU利用可能",
+                        f"GPU PCに接続しました。\n\nGPU: 利用可能（{device}）\n文字起こしモデル: {model}",
+                    )
+                elif kind == "server_unavailable":
+                    self.test_server_btn.configure(state="normal")
+                    self.status.set("GPUを利用できません。文字起こし時はこのPCのCPUを使用します")
+                    messagebox.showwarning(
+                        "GPUを利用できません",
+                        "GPU PCには接続しましたが、GPU文字起こしの準備ができていません。\n"
+                        "GPUサーバーの状態を確認してください。\n\n"
+                        "文字起こしを開始すると、このPCのCPUへ切り替わります。",
+                    )
                 elif kind == "server_error":
                     self.test_server_btn.configure(state="normal")
-                    messagebox.showerror("GPUサーバーに接続できません", value)
+                    self.status.set("GPU PCに接続できません。文字起こし時はこのPCのCPUを使用します")
+                    messagebox.showerror(
+                        "GPU PCに接続できません",
+                        f"GPU PCに接続できませんでした。\n文字起こし時はこのPCのCPUへ切り替わります。\n\n詳細: {value}",
+                    )
                 elif kind == "transcript":
                     seconds, line = value
                     self.transcript_entries.append((seconds, line))
@@ -667,7 +690,10 @@ class App(tk.Tk):
                 response = requests.get(server_url + "/health", headers={"X-API-Key": api_key}, timeout=8)
                 response.raise_for_status()
                 data = response.json()
-                self.events.put(("server_ok", f"接続済み: {data.get('model')} / {data.get('device')}"))
+                if data.get("ready") and data.get("gpu_available") and data.get("device") == "cuda":
+                    self.events.put(("server_ok", data))
+                else:
+                    self.events.put(("server_unavailable", data))
             except Exception as exc:
                 self.events.put(("server_error", str(exc)))
 
