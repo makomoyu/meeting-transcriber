@@ -34,7 +34,14 @@ def load_gpu_model():
 
 @app.get("/health", dependencies=[Depends(verify_api_key)])
 def health():
-    return {"ready": MODEL is not None, "model": MODEL_NAME, "device": "cuda"}
+    with MODEL_LOCK:
+        gpu_available = MODEL is not None
+        return {
+            "ready": gpu_available,
+            "gpu_available": gpu_available,
+            "model": MODEL_NAME if gpu_available else None,
+            "device": "cuda" if gpu_available else None,
+        }
 
 
 def transcribe_audio(audio, model_name=MODEL_NAME):
