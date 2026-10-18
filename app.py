@@ -70,6 +70,7 @@ class CaptureSession:
         self.wav_path = self.base.with_suffix(".wav")
         self.video_path = self.base.with_name(self.base.name + "_silent.mp4")
         self.mp4_path = self.base.with_suffix(".mp4")
+        self.transcript_path = self.base.with_name(self.base.name + "_文字起こし.txt")
 
     def start(self):
         self.stop_event.clear()
@@ -308,6 +309,8 @@ class App(tk.Tk):
         self.screen_finished = False
         self.transcription_finished = False
         self.mux_started = False
+        self.transcript_save_error = None
+        self.close_after_recording = False
         self.monitor_ids = {}
         self.capture_targets = {}
         try:
@@ -321,6 +324,7 @@ class App(tk.Tk):
         self._refresh_window_targets()
         self._build()
         self.after(100, self._poll_events)
+        self.after(30000, self._autosave_tick)
 
     def _refresh_window_targets(self):
         for label in [key for key, value in self.capture_targets.items() if value[0] == "window"]:
@@ -451,6 +455,8 @@ class App(tk.Tk):
         gpu_model = self.gpu_model_var.get()
         cpu_model = self.cpu_model_var.get()
         self.session = CaptureSession(self.events, self.mic_ids.get(self.mic_var.get()), capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model)
+        self.transcript_save_error = None
+        self._write_recording_transcript()  # 録画開始時に空のファイルを作成
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.mic_box.configure(state="disabled")
@@ -513,6 +519,7 @@ class App(tk.Tk):
                     self.transcript_lines.append(formatted)
                     self.text.insert("end", formatted + "\n")
                     self.text.see("end")
+                    self._write_recording_transcript()  # 新しい発言ごとに自動保存
                 elif kind == "file_transcript":
                     seconds, line = value
                     self.transcript_entries.append((seconds, line))
@@ -562,12 +569,16 @@ class App(tk.Tk):
                     self._maybe_mux()
                 elif kind == "transcription_done":
                     self.transcription_finished = True
+                    self._write_recording_transcript()  # 最終分も保存
                     self._maybe_mux()
                 elif kind == "mux_done":
-                    self.status.set(f"完了: {value}")
+                    transcript_path = self.session.transcript_path if self.session else None
+                    self.status.set(f"完了: {value}" + (f"\n文字起こし: {transcript_path}" if transcript_path else ""))
                     self.start_btn.configure(state="normal")
                     self.mic_box.configure(state="readonly")
                     self.target_box.configure(state="readonly")
+                    if self.close_after_recording:
+                        self._check_close_ready()
                 elif kind == "capture_error":
                     self.status.set(value)
                     messagebox.showerror("録画エラー", value)
@@ -590,6 +601,34 @@ class App(tk.Tk):
             self.mux_started = True
             self.status.set("文字起こし完了。音声付き動画を作成しています…")
             threading.Thread(target=self.session.mux, daemon=True).start()
+
+    def _write_recording_transcript(self):
+        """リアルタイム文字起こしを一時ファイル経由で安全に保存する。"""
+        if not self.session:
+            return False
+        path = self.session.transcript_path
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = "\n".join(self.transcript_lines)
+            if content:
+                content += "\n"
+            temp_path.write_text(content, encoding="utf-8")
+            temp_path.replace(path)
+            self.transcript_save_error = None
+            return True
+        except OSError as exc:
+            # 頻繁なポップアップを避け、画面の状態欄で保存失敗を知らせる。
+            self.transcript_save_error = str(exc)
+            self.status.set(f"文字起こしの自動保存に失敗しました: {exc}")
+            return False
+
+    def _autosave_tick(self):
+        """30秒ごとにも保存し、文字起こしが途切れている場合に備える。"""
+        if self.session and not self.transcription_finished:
+            self._write_recording_transcript()
+        if self.winfo_exists():
+            self.after(30000, self._autosave_tick)
 
     def _save_text(self):
         if not self.transcript_lines:
@@ -796,9 +835,24 @@ class App(tk.Tk):
 
     def _close(self):
         if self.session and self.session.threads and any(thread.is_alive() for thread in self.session.threads):
-            if not messagebox.askyesno("終了", "録画中です。録画を停止して終了しますか？"):
+            if not messagebox.askyesno("終了", "録画中です。録画を停止し、文字起こしを保存してから終了しますか？"):
                 return
-            self.session.stop()
+            self.close_after_recording = True
+            self._stop()
+            self.after(300, self._check_close_ready)
+            return
+        self._write_recording_transcript()
+        self.destroy()
+
+    def _check_close_ready(self):
+        """停止後の録音・文字起こしスレッドとイベント処理を待ってから終了する。"""
+        if not self.close_after_recording or not self.winfo_exists():
+            return
+        active = self.session and any(thread.is_alive() for thread in self.session.threads)
+        if active or not self.events.empty():
+            self.after(300, self._check_close_ready)
+            return
+        self._write_recording_transcript()
         self.destroy()
 
 
