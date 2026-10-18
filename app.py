@@ -301,6 +301,9 @@ class App(tk.Tk):
         self.preview_photo = None
         self.transcript_lines = []
         self.transcript_entries = []
+        self.current_file_entries = []
+        self.current_file_index = 0
+        self.file_batch_total = 0
         self.audio_finished = False
         self.screen_finished = False
         self.transcription_finished = False
@@ -389,6 +392,11 @@ class App(tk.Tk):
         self.test_server_btn.pack(side="left", padx=4)
         self.status = tk.StringVar(value="準備完了")
         ttk.Label(root, textvariable=self.status).pack(anchor="w", pady=(0, 8))
+        self.file_progress_frame = ttk.Frame(root)
+        self.file_progress_label = tk.StringVar(value="")
+        ttk.Label(self.file_progress_frame, textvariable=self.file_progress_label, width=52, anchor="w").pack(side="left")
+        self.file_progressbar = ttk.Progressbar(self.file_progress_frame, mode="determinate", maximum=1, value=0)
+        self.file_progressbar.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         panels = ttk.Panedwindow(root, orient="horizontal")
         panels.pack(fill="both", expand=True)
@@ -508,27 +516,39 @@ class App(tk.Tk):
                 elif kind == "file_transcript":
                     seconds, line = value
                     self.transcript_entries.append((seconds, line))
+                    self.current_file_entries.append((seconds, line))
                     formatted = f"[{self._format_time(seconds)}] {line}"
                     self.transcript_lines.append(formatted)
                     self.text.insert("end", formatted + "\n")
                     self.text.see("end")
                 elif kind == "file_done":
                     source, subtitle_path = value
+                    self.file_progressbar.configure(maximum=max(self.file_batch_total, 1), value=self.current_file_index)
+                    self.file_progress_label.set(f"完了 {self.current_file_index}/{self.file_batch_total}: {Path(source).name}")
                     self.status.set(f"文字起こしを保存しました: {Path(source).stem}_文字起こし.txt")
-                    if self.transcript_entries:
-                        self._open_review(source, self.transcript_entries.copy())
+                    if self.current_file_entries:
+                        self._open_review(source, self.current_file_entries.copy())
                 elif kind == "file_error":
                     source, error = value
+                    self.file_progressbar.configure(maximum=max(self.file_batch_total, 1), value=self.current_file_index)
+                    self.file_progress_label.set(f"失敗 {self.current_file_index}/{self.file_batch_total}: {Path(source).name}")
                     self.status.set(f"文字起こしに失敗: {Path(source).name}")
                 elif kind == "file_started":
                     source, index, total = value
-                    self.transcript_entries = []
-                    self.transcript_lines = []
-                    self.text.delete("1.0", "end")
+                    self.current_file_index = index
+                    self.file_batch_total = total
+                    self.current_file_entries = []
+                    self.file_progress_label.set(f"処理中 {index}/{total}: {Path(source).name}")
+                    heading = f"\n===== {Path(source).name} ({index}/{total}) ====="
+                    self.transcript_lines.append(heading)
+                    self.text.insert("end", heading + "\n")
+                    self.text.see("end")
                     self.status.set(f"文字起こし中（{index}/{total}）: {Path(source).name}")
                 elif kind == "file_batch_done":
                     count, failures = value
                     self.import_btn.configure(state="normal")
+                    self.file_progressbar.configure(maximum=max(self.file_batch_total, 1), value=self.file_batch_total)
+                    self.file_progress_label.set(f"バッチ完了: 成功 {count} / 失敗 {len(failures)} ファイル")
                     self.status.set(f"処理完了: 成功 {count} / 失敗 {len(failures)} ファイル")
                     if failures:
                         details = "\n\n".join(f"{Path(source).name}: {error}" for source, error in failures)
@@ -604,7 +624,13 @@ class App(tk.Tk):
             return
         self.transcript_entries = []
         self.transcript_lines = []
+        self.current_file_entries = []
+        self.current_file_index = 0
+        self.file_batch_total = len(paths)
         self.text.delete("1.0", "end")
+        self.file_progressbar.configure(maximum=len(paths), value=0)
+        self.file_progress_label.set(f"準備中 0/{len(paths)} ファイル")
+        self.file_progress_frame.pack(fill="x", pady=(0, 8))
         self.import_btn.configure(state="disabled")
         self.status.set(f"{len(paths)}ファイルを順番に文字起こしします…")
         gpu_model = self.gpu_model_var.get()
