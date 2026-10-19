@@ -1,4 +1,6 @@
 import queue
+import os
+import site
 import subprocess
 import threading
 import time
@@ -23,6 +25,41 @@ SAMPLE_RATE = 16000
 AUDIO_BLOCK = 0.25
 VIDEO_FPS = 8
 TRANSCRIBE_SECONDS = 5
+_CUDA_DLL_HANDLES = []
+
+
+def prepare_cuda_runtime():
+    """Add pip-installed NVIDIA CUDA DLL folders to Windows DLL search paths."""
+    if os.name != "nt":
+        return
+    roots = []
+    try:
+        roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+    for root in dict.fromkeys(roots):
+        for relative in ("nvidia/cublas/bin", "nvidia/cudnn/bin", "nvidia/cublas/lib", "nvidia/cudnn/lib"):
+            dll_dir = Path(root) / relative
+            if dll_dir.is_dir():
+                try:
+                    _CUDA_DLL_HANDLES.append(os.add_dll_directory(str(dll_dir)))
+                except (AttributeError, OSError):
+                    pass
+
+
+def detect_local_gpu():
+    """Check CUDA availability through CTranslate2, the runtime used by faster-whisper."""
+    try:
+        prepare_cuda_runtime()
+        import ctranslate2
+        count = ctranslate2.get_cuda_device_count()
+        return count > 0, count, None
+    except Exception as exc:
+        return False, 0, str(exc)
 
 
 def list_windows():
@@ -51,7 +88,7 @@ def list_windows():
 
 
 class CaptureSession:
-    def __init__(self, event_queue, mic_id, capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model):
+    def __init__(self, event_queue, mic_id, capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model, local_gpu_available):
         self.events = event_queue
         self.mic_id = mic_id
         self.capture_kind = capture_kind
@@ -62,6 +99,7 @@ class CaptureSession:
         self.backend = backend
         self.gpu_model = gpu_model
         self.cpu_model = cpu_model
+        self.local_gpu_available = local_gpu_available
         self.local_model = None
         self.stop_event = threading.Event()
         self.audio_queue = queue.Queue()
@@ -217,6 +255,8 @@ class CaptureSession:
         try:
             if self.backend == "gpu":
                 self.events.put(("status", "GPUサーバーで文字起こし中"))
+            elif self.backend == "local_gpu":
+                self.events.put(("status", f"このPCのGPU（{self.gpu_model}モデル）で文字起こし中"))
             else:
                 self.events.put(("status", f"このPCのCPU（{self.cpu_model}モデル）で文字起こし中"))
             batch = []
@@ -242,11 +282,22 @@ class CaptureSession:
             self.events.put(("transcription_done", None))
 
     def _transcribe_batch(self, audio, offset_samples):
-        if self.backend == "gpu":
+        offset_seconds = offset_samples / SAMPLE_RATE
+        if self.backend == "local_gpu":
+            try:
+                segments = self._local_segments(audio, offset_seconds, use_gpu=True)
+            except Exception as exc:
+                self.local_gpu_available = False
+                self.local_model = None
+                self.events.put(("status", f"このPCのGPUを使えないため切り替えます: {exc}"))
+                self.backend = "gpu" if self.server_url and self.api_key else "local"
+                self._transcribe_batch(audio, offset_samples)
+                return
+        elif self.backend == "gpu":
             try:
                 response = requests.post(
                     self.server_url + "/transcribe/chunk",
-                    params={"offset": offset_samples / SAMPLE_RATE, "model": self.gpu_model},
+                    params={"offset": offset_seconds, "model": self.gpu_model},
                     headers={"X-API-Key": self.api_key, "Content-Type": "application/octet-stream"},
                     data=audio.astype("<f4", copy=False).tobytes(),
                     timeout=(4, 180),
@@ -254,21 +305,26 @@ class CaptureSession:
                 response.raise_for_status()
                 segments = response.json().get("segments", [])
             except Exception as exc:
-                self.backend = "local"
-                self.events.put(("status", f"GPUサーバーに接続できないため、このPCで処理します: {exc}"))
-                segments = self._local_segments(audio, offset_samples / SAMPLE_RATE)
+                self.events.put(("status", f"GPUサーバーを使えないため、このPCで処理します: {exc}"))
+                self.backend = "local_gpu" if self.local_gpu_available else "local"
+                self._transcribe_batch(audio, offset_samples)
+                return
         else:
-            segments = self._local_segments(audio, offset_samples / SAMPLE_RATE)
+            segments = self._local_segments(audio, offset_seconds)
         for segment in segments:
             text = segment["text"].strip()
             if text:
                 self.events.put(("transcript", (segment["start"], text)))
 
-    def _local_segments(self, audio, offset_seconds):
+    def _local_segments(self, audio, offset_seconds, use_gpu=False):
         if self.local_model is None:
-            self.events.put(("status", "このPC用の文字起こしモデルを準備しています（初回はモデルを取得します）…"))
+            model_name = self.gpu_model if use_gpu else self.cpu_model
+            device = "cuda" if use_gpu else "cpu"
+            compute_type = "float16" if use_gpu else "int8"
+            self.events.put(("status", f"このPCの{'GPU' if use_gpu else 'CPU'}用モデルを準備しています（初回はモデルを取得します）…"))
+            prepare_cuda_runtime()
             from faster_whisper import WhisperModel
-            self.local_model = WhisperModel(self.cpu_model, device="cpu", compute_type="int8")
+            self.local_model = WhisperModel(model_name, device=device, compute_type=compute_type)
         segments, _ = self.local_model.transcribe(audio, language="ja", vad_filter=True, beam_size=5)
         return [
             {"start": offset_seconds + segment.start, "text": segment.text.strip()}
@@ -307,6 +363,7 @@ class App(tk.Tk):
         self.mux_started = False
         self.monitor_ids = {}
         self.capture_targets = {}
+        self.local_gpu_available, self.local_gpu_count, self.local_gpu_error = detect_local_gpu()
         try:
             with mss.MSS() as sct:
                 for index, monitor in enumerate(sct.monitors[1:], start=1):
@@ -372,7 +429,7 @@ class App(tk.Tk):
         self.cpu_model_var = tk.StringVar(value="small")
         self.cpu_model_box = ttk.Combobox(model_controls, textvariable=self.cpu_model_var, values=("small", "base", "tiny"), state="readonly", width=10)
         self.cpu_model_box.pack(side="left", padx=6)
-        ttk.Label(model_controls, text="GPU PCが使えない場合はCPUモデルに自動切替").pack(side="left", padx=(8, 0))
+        ttk.Label(model_controls, text="優先順: このPCのGPU → GPU PC → このPCのCPU").pack(side="left", padx=(8, 0))
         self.start_btn = ttk.Button(controls, text="録画開始", command=self._start)
         self.start_btn.pack(side="left", padx=(12, 4))
         self.stop_btn = ttk.Button(controls, text="録画停止", command=self._stop, state="disabled")
@@ -387,7 +444,11 @@ class App(tk.Tk):
         ttk.Entry(server_controls, textvariable=self.api_key_var, show="•", width=28).pack(side="left", padx=6)
         self.test_server_btn = ttk.Button(server_controls, text="接続確認", command=self._test_server)
         self.test_server_btn.pack(side="left", padx=4)
-        self.status = tk.StringVar(value="準備完了")
+        if self.local_gpu_available:
+            initial_status = f"準備完了（このPCのGPUを検出: {self.local_gpu_count}台。文字起こしではローカルGPUを優先します）"
+        else:
+            initial_status = "準備完了（このPCではCUDA GPUを利用できません。GPUサーバーまたはCPUを使用します）"
+        self.status = tk.StringVar(value=initial_status)
         ttk.Label(root, textvariable=self.status).pack(anchor="w", pady=(0, 8))
 
         panels = ttk.Panedwindow(root, orient="horizontal")
@@ -417,8 +478,10 @@ class App(tk.Tk):
         if self.target_var.get() not in self.capture_targets:
             messagebox.showwarning("録画対象", "録画対象を選択してください。アプリが一覧にない場合は一覧を更新してください。")
             return
-        backend = "local"
-        if server_url and api_key:
+        backend = "local_gpu" if self.local_gpu_available else "local"
+        if self.local_gpu_available:
+            self.status.set(f"このPCのGPU（{self.gpu_model_var.get()}モデル）を優先して使用します")
+        elif server_url and api_key:
             try:
                 health = requests.get(server_url + "/health", headers={"X-API-Key": api_key}, timeout=4)
                 health.raise_for_status()
@@ -442,7 +505,7 @@ class App(tk.Tk):
         capture_kind, capture_value = self.capture_targets[self.target_var.get()]
         gpu_model = self.gpu_model_var.get()
         cpu_model = self.cpu_model_var.get()
-        self.session = CaptureSession(self.events, self.mic_ids.get(self.mic_var.get()), capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model)
+        self.session = CaptureSession(self.events, self.mic_ids.get(self.mic_var.get()), capture_kind, capture_value, server_url, api_key, backend, gpu_model, cpu_model, self.local_gpu_available)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.mic_box.configure(state="disabled")
@@ -450,6 +513,8 @@ class App(tk.Tk):
         self.session.start()
         if backend == "gpu":
             self.status.set(f"録画を開始しています（GPU PC: {gpu_model}、CPU fallback: {cpu_model}）…")
+        elif backend == "local_gpu":
+            self.status.set(f"録画を開始しています（このPCのGPU・{gpu_model}モデル）…")
         else:
             self.status.set(f"録画を開始しています（ローカルCPU・{cpu_model}モデル）…")
 
@@ -638,7 +703,21 @@ class App(tk.Tk):
                     stderr = result.stderr.decode("utf-8", errors="replace")
                     raise RuntimeError("動画から音声を取り出せませんでした。\n" + stderr[-1200:])
             segments = None
-            if server_url and api_key:
+            if self.local_gpu_available:
+                try:
+                    self.events.put(("status", f"このPCのGPU（{gpu_model}モデル）で文字起こし中…"))
+                    prepare_cuda_runtime()
+                    from faster_whisper import WhisperModel
+                    model = WhisperModel(gpu_model, device="cuda", compute_type="float16")
+                    local_segments, _ = model.transcribe(str(audio_path), language="ja", vad_filter=True, beam_size=5)
+                    segments = [
+                        {"start": segment.start, "end": segment.end, "text": segment.text}
+                        for segment in local_segments
+                    ]
+                except Exception as exc:
+                    self.local_gpu_available = False
+                    self.events.put(("status", f"このPCのGPUを使えないため、次の方法を試します: {exc}"))
+            if segments is None and server_url and api_key:
                 try:
                     self.events.put(("status", "音声をGPU PCへ送信して文字起こし中…"))
                     with audio_path.open("rb") as audio_file:

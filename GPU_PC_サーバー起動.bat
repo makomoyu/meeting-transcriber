@@ -3,16 +3,10 @@ setlocal
 cd /d "%~dp0"
 title GPU transcription server
 
-set "PYTHON_CMD=py"
-where py >nul 2>&1
-if errorlevel 1 (
-  set "PYTHON_CMD=python"
-  where python >nul 2>&1
-  if errorlevel 1 (
-    echo ERROR: Python was not found. Install Python 3.10 or later.
-    pause
-    exit /b 1
-  )
+if not exist "%~dp0.venv\Scripts\python.exe" (
+  echo Setup has not been completed. Run GPU_PC_初回セットアップ.bat first.
+  pause
+  exit /b 1
 )
 
 if not exist "%~dp0api_key.txt" (
@@ -31,6 +25,6 @@ if not defined TRANSCRIBE_API_KEY (
 set WHISPER_MODEL=medium
 echo Starting GPU transcription server. Press Ctrl+C to stop.
 echo Keep this window open while the recorder PC is connected.
-"%PYTHON_CMD%" -m uvicorn gpu_server:app --host 0.0.0.0 --port 8765
+"%~dp0.venv\Scripts\python.exe" -m uvicorn gpu_server:app --host 0.0.0.0 --port 8765
 echo Server stopped.
 pause

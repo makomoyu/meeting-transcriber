@@ -1,42 +1,60 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title GPU server setup
+title GPU PC setup
 
-set "PYTHON_CMD=py"
+set "PYTHON_LAUNCHER=py"
+set "PYTHON_ARGS=-3"
 where py >nul 2>&1
 if errorlevel 1 (
-  set "PYTHON_CMD=python"
+  set "PYTHON_LAUNCHER=python"
+  set "PYTHON_ARGS="
   where python >nul 2>&1
   if errorlevel 1 (
-    echo ERROR: Python was not found. Install Python 3.10 or later and try again.
+    echo ERROR: Python 3.10 or later was not found.
+    echo Install Python and enable the option to add it to PATH, then retry.
     pause
     exit /b 1
   )
 )
 
-echo [1/3] Installing server packages...
-"%PYTHON_CMD%" -m pip install --upgrade pip
+if not exist "%~dp0.venv\Scripts\python.exe" (
+  echo [1/5] Creating an isolated Python environment...
+  %PYTHON_LAUNCHER% %PYTHON_ARGS% -m venv "%~dp0.venv"
+  if errorlevel 1 goto :failed
+)
+
+set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
+echo [2/5] Updating pip...
+"%VENV_PYTHON%" -m pip install --upgrade pip
 if errorlevel 1 goto :failed
-"%PYTHON_CMD%" -m pip install -r "%~dp0server-requirements.txt"
+
+echo [3/5] Installing the app and API server packages...
+"%VENV_PYTHON%" -m pip install -r "%~dp0requirements.txt" -r "%~dp0server-requirements.txt"
+if errorlevel 1 goto :failed
+
+echo [4/5] Installing NVIDIA CUDA 12 libraries for faster-whisper...
+"%VENV_PYTHON%" -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 if errorlevel 1 goto :failed
 
 if not exist "%~dp0api_key.txt" (
-  echo [2/3] Creating API key...
-  "%PYTHON_CMD%" -c "import secrets; print(secrets.token_urlsafe(32))" > "%~dp0api_key.txt"
+  echo [5/5] Creating an API key for other PCs...
+  "%VENV_PYTHON%" -c "import secrets; print(secrets.token_urlsafe(32))" > "%~dp0api_key.txt"
   if errorlevel 1 goto :failed
 ) else (
-  echo [2/3] Keeping existing API key.
+  echo [5/5] Keeping the existing API key.
 )
 
-echo [3/3] Setup complete.
-echo API key file: "%~dp0api_key.txt"
-echo Copy the key into the recorder PC app.
-echo GPU mode also needs the NVIDIA driver, CUDA 12 cuBLAS, and cuDNN 9.
+echo.
+echo Setup complete.
+echo Start the local recording app with GPU_PC_Local_App_Start.bat
+echo Start the LAN API server with GPU_PC_サーバー起動.bat
+echo The NVIDIA display driver must be installed. First model use downloads the selected Whisper model.
 pause
 exit /b 0
 
 :failed
-echo Setup failed. Check the error shown above.
+echo.
+echo Setup failed. Review the error above. The virtual environment is at "%~dp0.venv".
 pause
 exit /b 1

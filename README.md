@@ -1,39 +1,22 @@
 # 会議録画・LAN内GPUリアルタイム文字起こし（Windows）
 
-このアプリは、録画PCでモニターまたは選択したアプリのウィンドウと音声を記録します。GPU PC（RTX 3060）が使える場合は音声をLAN経由で処理し、使えない場合は録画PCのCPUでsmallモデルを使って文字起こしします。画面動画はGPU PCへ送りません。
+このアプリは、モニターまたは選択したアプリのウィンドウと音声を記録し、リアルタイムと録画後の文字起こしを行います。CUDA対応GPUがあるPCではそのPCのGPUを最優先で使います。ローカルGPUがない場合はLAN上のGPU PC、どちらも使えない場合はローカルCPUに切り替えます。画面動画はGPUサーバーへ送りません。
 
 ## 1. GPU PCの準備（RTX 3060）
 
-1. NVIDIAの最新ドライバーを入れ、Python 3.10以降をインストールします。
-2. このフォルダーをGPU PCにもコピーし、PowerShellでそのフォルダーを開きます。
-3. GPUでfaster-whisperを使うため、CUDA 12用cuBLASとcuDNN 9を用意します。Windows向けの案内は[faster-whisperのGPU設定](https://github.com/SYSTRAN/faster-whisper#gpu)を参照してください。
-4. サーバー用パッケージを入れます。
-   ```powershell
-   py -m pip install -r server-requirements.txt
-   ```
-5. APIキーを決め、GPUサーバーを起動します。APIキーは長く推測されにくい値に置き換えてください。
-   ```powershell
-   $env:TRANSCRIBE_API_KEY = "ここに十分長い秘密のキー"
-   $env:WHISPER_MODEL = "medium"
-   py -m uvicorn gpu_server:app --host 0.0.0.0 --port 8765
-   ```
-   初回起動時にmediumモデルがダウンロードされます。起動中はPowerShellのウィンドウを開いたままにします。
-6. Windowsファイアウォールでは、TCP 8765番ポートをプライベートネットワーク内からだけ許可します。ルーターのポート開放はしません。GPU PCのIPv4アドレスは `ipconfig` で確認できます。
+1. NVIDIAドライバーとPython 3.10以降をインストールし、`nvidia-smi` でGPUを確認します。
+2. このフォルダーをGPU PCへコピーし、`GPU_PC_初回セットアップ.bat` を実行します。依存パッケージとCUDA 12用cuBLAS・cuDNNを専用の `.venv` にpipで導入します。
+3. GPU PC自身でアプリを使う場合は `GPU_PC_Local_App_Start.bat` を実行します。
+4. 録画PCから使う場合は `GPU_PC_サーバー起動.bat` を実行します。ファイアウォール設定が未実施なら `GPU_PC_ファイアウォール設定.bat` を管理者として実行します。サーバー画面は起動中開いたままにします。
+5. GPU PCのIPv4アドレスは `ipconfig` で確認できます。ルーターのポート開放はしません。
 
 ## 2. 録画PCの準備
 
-1. 依存パッケージをインストールします。
-   ```powershell
-   py -m pip install -r requirements.txt
-   ```
-2. アプリを起動します。
-   ```powershell
-   py app.py
-   ```
-3. GPU PCを使う場合は、「GPU PCのURL」と「APIキー」を設定し、「接続確認」を押します。GPUモデルの読み込みが完了していれば、GPU利用可能とモデル名をメッセージボックスに表示します。GPU PCに接続できない場合やGPUを利用できない場合も状態を表示し、文字起こし時はCPUへ切り替わります。GPU使用時とCPU使用時のモデルは事前に選べます（初期値はGPUがmedium、CPUがsmall）。
-4. 「録画対象」でモニターまたはアプリを選びます。アプリが候補にない場合は、対象アプリを開いて「アプリ一覧更新」を押します。マイクを選び、「録画開始」を押します。
-5. GPU PCが使える場合は音声を約5秒ごとに送り、文字起こしを時刻付きで表示します。GPU PCが使えない場合は録画PCのCPUで処理します。ローカル処理の初回は選択したCPUモデルのダウンロードが必要です。
-6. 会議後のファイル文字起こしも、選択したGPUモデルを優先し、接続できない場合は選択したCPUモデルで処理します。動画の場合は録画PCで音声を取り出します。「録音ファイルを読み込んで文字起こし」から複数ファイルを選択でき、各ファイルと同じフォルダーに `元のファイル名_文字起こし.txt` と `元のファイル名_字幕.srt` を保存します。選択したファイルは順番に処理します。
+1. GPU PC以外では、`py -m pip install -r requirements.txt` の後に `py app.py` で起動できます。
+2. 起動時にローカルCUDA GPUを検出します。GPUが使える場合はこのPCのGPU、なければGPU PCのAPI、さらに使えない場合はCPUの順に使います。GPUモデルとCPUモデルは事前に選べます（初期値はGPUがmedium、CPUがsmall）。
+3. 「録画対象」でモニターまたはアプリを選び、必要ならマイクを選択して「録画開始」を押します。
+4. GPU PCをAPIとして使う場合は「GPU PCのURL」と「APIキー」を設定します。ローカルGPUが利用可能な場合はローカルGPUが優先され、APIはローカルGPUの実行に失敗した場合に使われます。
+5. 録画後の複数ファイル文字起こしも、ローカルGPU、GPUサーバー、ローカルCPUの順で処理します。TXTとSRTは各ファイルの隣に保存します。
 
 ## ネットワークとデータ
 
